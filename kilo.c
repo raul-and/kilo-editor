@@ -6,8 +6,10 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 #include <errno.h>
 #include <ctype.h>
@@ -17,6 +19,8 @@
 /*** defines ***/
 
 #define KILO_VERSION "0.0.1"
+#define KILO_TAB_STOP 8
+
 #define CTRL_KEY(key) ((key) & 0x1f)
 
 enum editorKey{
@@ -34,17 +38,24 @@ enum editorKey{
 /*** data ***/
 
 typedef struct editorRow{
-    int size;
     char *text;
+    int tSize;
+    char *render;
+    int rSize; 
 } editorRow;
 
 struct editorConfig {
-    int cx, cy;
+    int cX, cY;
+    int rX;
     int rowOff;
+    int colOff;
     int screenRows;
     int screenCols;
-    int numrows;
-    editorRow *erow;
+    int numRows;
+    editorRow *eRow;
+    char *filename;
+    char statusmsg[80];
+    time_t statusmsgTime;
     struct termios origTermios;
 };
 
@@ -166,20 +177,60 @@ int getWindowSize(int *rows, int *cols){
 
 /*** row operations ***/
 
-void editorAppendRow(char *s, size_t len){
-    conf.erow = realloc(conf.erow, sizeof(editorRow) * ((conf.numrows) + 1));
+int editorRowCxToRx(editorRow *erow, int cX){
+    int rX =0;
+    for (int j = 0; j < cX; j++){
+        if(erow->text[j] == '\t')
+            rX += (KILO_TAB_STOP - 1) - (rX % KILO_TAB_STOP);
+        rX++;
+    }
+    
+    return rX;
+}
 
-    int at = conf.numrows;
-    conf.erow[at].size = len;
-    conf.erow[at].text = malloc(len + 1);
-    memcpy(conf.erow[at].text, s, len);
-    conf.erow[at].text[len] = '\0';
-    conf.numrows++;
+void editorUpdateRow(editorRow *erow){
+    int tabs = 0;
+    for (int j = 0; j < erow->tSize; j++)
+        if (erow->text[j] == '\0') tabs++;
+    
+    free(erow->render);
+    erow->render = malloc(erow->tSize + tabs*(KILO_TAB_STOP-1) + 1);
+
+    int idx = 0;
+    for (int j = 0; j < erow->tSize; j++){
+        if(erow->text[j] == '\t'){
+            erow->render[idx++] = ' ';
+            while (idx % KILO_TAB_STOP != 0) erow->render[idx++] = ' ';
+        } else
+            erow->render[idx++] = erow->text[j];
+    }
+
+    erow->render[idx] = '\0';
+    erow->rSize = idx;
+}
+
+void editorAppendRow(char *s, size_t len){
+    conf.eRow = realloc(conf.eRow, sizeof(editorRow) * ((conf.numRows) + 1));
+
+    int at = conf.numRows;
+    conf.eRow[at].tSize = len;
+    conf.eRow[at].text = malloc(len + 1);
+    memcpy(conf.eRow[at].text, s, len);
+    conf.eRow[at].text[len] = '\0';
+    
+    conf.eRow[at].rSize = 0;
+    conf.eRow[at].render = NULL;
+    editorUpdateRow(&conf.eRow[at]);
+    
+    conf.numRows++;
 }
 
 /*** file i/o ***/
 
 void editorOpen(char *fileName){
+    free(conf.filename);
+    conf.filename = strdup(fileName);
+    
     FILE *fp = fopen(fileName, "r");
     if (!fp) die("fopen");
 
@@ -222,11 +273,30 @@ void abFree(struct abuf *ab){
 
 /*** output ***/
 
+void editorScroll(){
+    conf.rX = 0;
+    if (conf.cY < conf.numRows)
+        conf.rX = editorRowCxToRx(&conf.eRow[conf.cY], conf.cX);
+
+    if (conf.cY < conf.rowOff)
+        conf.rowOff = conf.cY;
+
+    if (conf.cY >= conf.rowOff + conf.screenRows)
+        conf.rowOff = conf.cY - conf.screenRows + 1;
+
+    if (conf.rX < conf.colOff)
+        conf.colOff = conf.rX;
+    
+    if (conf.rX >= conf.colOff + conf.screenCols)
+        conf.colOff = conf.rX - conf.screenCols + 1;
+}
+
 void editorDrawRows(struct abuf *ab){
     int y;
     for (y = 0; y < conf.screenRows; y++){
-        if (y >= conf.numrows){
-            if(conf.numrows == 0 && y == conf.screenRows / 3){
+        int fileRow = y + conf.rowOff;
+        if (fileRow >= conf.numRows){
+            if(conf.numRows == 0 && y == conf.screenRows / 3){
                 char welcome[80];
                 int welcomeLen = snprintf(welcome, sizeof(welcome),
                     "Kilo editor -- version %s", KILO_VERSION);
@@ -245,28 +315,65 @@ void editorDrawRows(struct abuf *ab){
                 abAppend(ab, "~", 1);
 
         } else {
-            int len = conf.erow[y].size;
+            int len = conf.eRow[fileRow].rSize - conf.colOff;
+            if (len < 0) len = 0;
             if (len > conf.screenCols) len = conf.screenCols;
-            abAppend(ab, conf.erow[y].text, len);
+            abAppend(ab, &conf.eRow[fileRow].render[conf.colOff], len);
         }
 
         abAppend(ab, "\x1b[K", 3);
 
-        if (y < conf.screenRows - 1)
-            abAppend(ab, "\r\n", 2); 
+        abAppend(ab, "\r\n", 2); 
     }
 }
 
+void editorDrawStatusBar(struct abuf *ab){
+    abAppend(ab, "\x1b[7m", 4);
+
+    char status[80], rstatus[80];
+    int len = snprintf(status, sizeof(status), "%.20s - %d lines",
+                        conf.filename ? conf.filename: "[No name]", conf.numRows);
+    int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", conf.cY + 1, conf.numRows);
+    if (len > conf.screenCols) len = conf.screenCols;
+    abAppend(ab, status, len);
+
+    while (len < conf.screenCols){
+        if (conf.screenCols - len == rlen){
+            abAppend(ab, rstatus, rlen);
+            break;
+        } else {
+            abAppend(ab, " ", 1);
+            len++;
+        }
+    }
+
+    abAppend(ab, "\x1b[m", 3);
+    abAppend(ab, "\r\n", 2);
+}
+
+void editorDrawMessageBar(struct abuf *ab){\
+  abAppend(ab, "\x1b[K", 3);
+  int msglen = strlen(conf.statusmsg);
+  if (msglen > conf.screenCols) msglen = conf.screenCols;
+  if (msglen && time(NULL) - conf.statusmsgTime < 5)
+    abAppend(ab, conf.statusmsg, msglen);
+}
+
 void editorRefreshScreen(){
+    editorScroll();
+    
     struct abuf ab = ABUF_INIT;
     
     abAppend(&ab, "\x1b[?25l", 6);
     abAppend(&ab, "\x1b[H", 3);
 
     editorDrawRows(&ab);
+    editorDrawStatusBar(&ab);
+    editorDrawMessageBar(&ab);
 
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", conf.cy + 1, conf.cx + 1);
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (conf.cY - conf.rowOff) + 1,
+                                              (conf.rX - conf.colOff) + 1);
     abAppend(&ab, buf, strlen(buf));
 
     abAppend(&ab, "\x1b[?25h", 6);
@@ -275,26 +382,52 @@ void editorRefreshScreen(){
     abFree(&ab);
 }
 
+void editorSetStatusMessage(const char *fmt, ...){
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(conf.statusmsg, sizeof(conf.statusmsg), fmt, ap);
+    va_end(ap);
+    conf.statusmsgTime = time(NULL);
+}
+
 /*** input ***/
 
 void editorMoveCursor(int key){
+    editorRow *row = (conf.cY >= conf.numRows) ? NULL : &conf.eRow[conf.cY];
+    
     switch(key){
         case ARROW_UP:
-        if(conf.cy != 0)
-            conf.cy--;
-        break;
+            if(conf.cY != 0)
+                conf.cY--;
+            break;
+            
         case ARROW_LEFT:
-        if(conf.cx != 0)
-            conf.cx--;
-        break;
+            if(conf.cX != 0)
+                conf.cX--;
+            else if (conf.cY > 0){
+                conf.cY--;
+                conf.cX = conf.eRow[conf.cY].tSize;
+            }
+            break;
+
         case ARROW_DOWN:
-        if(conf.cy != conf.screenRows-1)
-            conf.cy++;
-        break;
+            if(conf.cY < conf.numRows)
+                conf.cY++;
+            break;
+
         case ARROW_RIGHT:
-        if(conf.cx != conf.screenCols-1)
-            conf.cx++;
-        break;
+            if (row && conf.cX < row->tSize)
+                conf.cX++;
+            else if (row && conf.cX == row->tSize){
+                conf.cY++;
+                conf.cX = 0;
+            }
+            break;
+
+        row = (conf.cY >= conf.numRows ? NULL : &conf.eRow[conf.cY]);
+        int rowLen = row ? row->tSize : 0;
+        if (conf.cX > rowLen)
+            conf.cX = rowLen;
     }
 }
 
@@ -316,16 +449,24 @@ void editorProcessKeypress(){
             break;
 
         case HOME_KEY:
-            conf.cx = 0;
+            conf.cX = 0;
             break;
 
         case END_KEY:
-            conf.cx = conf.screenCols-1;
+            if (conf.cY < conf.numRows)
+                conf.cX = conf.eRow[conf.cY].tSize;
             break;
 
         case PAGE_UP:
         case PAGE_DOWN:
             {
+                if (key == PAGE_UP)
+                    conf.cY = conf.rowOff;
+                else if (key == PAGE_DOWN){
+                    conf.cY = conf.rowOff + conf.screenRows -1;
+                    if (conf.cY > conf.numRows) conf.cY = conf.numRows;
+                }
+
                 int times = conf.screenRows;
                 while (times--)
                     editorMoveCursor(key == PAGE_UP ? ARROW_UP : ARROW_DOWN);
@@ -336,11 +477,18 @@ void editorProcessKeypress(){
 /*** init ***/
 
 void initEditor(){
-    conf.cx = 0;
-    conf.cy = 0;
-    conf.erow = NULL;
+    conf.cX = 0;
+    conf.cY = 0;
+    conf.rX = 0;
+    conf.rowOff = 0;
+    conf.colOff = 0;
+    conf.eRow = NULL;
+    conf.filename = NULL;
+    conf.statusmsg[0] = '\0';
+    conf.statusmsgTime = 0;
     
     if (getWindowSize(&conf.screenRows, &conf.screenCols) == -1) die("getWindowSize");
+    conf.screenRows -= 2;
 }
 
 int main(int argc, char *argv[]) {
@@ -349,6 +497,8 @@ int main(int argc, char *argv[]) {
     if (argc >= 2)
         editorOpen(argv[1]);
     
+    editorSetStatusMessage("HELP: Ctrl-Q: quit");
+
     while (1){
         editorRefreshScreen();
         editorProcessKeypress();
