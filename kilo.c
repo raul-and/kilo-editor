@@ -24,6 +24,7 @@
 #define CTRL_KEY(key) ((key) & 0x1f)
 
 enum editorKey{
+    BACKSPACE = 127,
     ARROW_UP = 1000,
     ARROW_DOWN,
     ARROW_LEFT,
@@ -225,7 +226,44 @@ void editorAppendRow(char *s, size_t len){
     conf.numRows++;
 }
 
+void editorRowInsertChar(editorRow *erow, int at, int c){
+    if (at < 0 || at > erow->tSize) at = erow->tSize;
+    erow->text = realloc(erow->text, erow->tSize + 2);
+    memmove(&erow->text[at+1], &erow->text[at], erow->tSize - at + 1);
+    erow->tSize++;
+    erow->text[at] = c;
+    editorUpdateRow(erow);
+}
+
+/*** editor operations ***/
+
+void editorInsertChar(int c){
+    if (conf.cY == conf.numRows)
+        editorAppendRow("", 0);
+    editorRowInsertChar(&conf.eRow[conf.cY], conf.cX, c);
+    conf.cX++;
+}
+
 /*** file i/o ***/
+
+char *editorRowsToString(int *buflen){
+    int totLen = 0;
+    for (int j = 0; j < conf.numRows; j++)
+        totLen += conf.eRow[j].tSize + 1;
+    *buflen = totLen;
+
+    char *buf = malloc(totLen);
+    char *p = buf;
+
+    for(int j = 0; j < conf.numRows; j++){
+        memcpy(p, conf.eRow[j].text, conf.eRow[j].tSize);
+        p += conf.eRow[j].tSize;
+        *p = '\n';
+        p++;
+    }
+
+    return buf;
+}
 
 void editorOpen(char *fileName){
     free(conf.filename);
@@ -435,17 +473,14 @@ void editorProcessKeypress(){
     int key = editorReadKey();
 
     switch (key){
+        case 'r':
+            /*todo*/
+            break;
+
         case CTRL_KEY('q'):
             write(STDOUT_FILENO, "\x1b[2J", 4);
             write(STDOUT_FILENO, "\x1b[H", 3);
             exit(0);
-            break;
-
-        case ARROW_UP:
-        case ARROW_DOWN:
-        case ARROW_LEFT:
-        case ARROW_RIGHT:
-            editorMoveCursor(key);
             break;
 
         case HOME_KEY:
@@ -455,6 +490,12 @@ void editorProcessKeypress(){
         case END_KEY:
             if (conf.cY < conf.numRows)
                 conf.cX = conf.eRow[conf.cY].tSize;
+            break;
+
+        case BACKSPACE:
+        case CTRL_KEY('h'):
+        case DEL_KEY:
+            /*todo*/
             break;
 
         case PAGE_UP:
@@ -471,6 +512,21 @@ void editorProcessKeypress(){
                 while (times--)
                     editorMoveCursor(key == PAGE_UP ? ARROW_UP : ARROW_DOWN);
             }
+
+        case ARROW_UP:
+        case ARROW_DOWN:
+        case ARROW_LEFT:
+        case ARROW_RIGHT:
+            editorMoveCursor(key);
+            break;
+
+        case CTRL_KEY('l'):
+        case '\x1b':
+            break;
+
+        default:
+            editorInsertChar(key);
+            break;
     }
 }
 
