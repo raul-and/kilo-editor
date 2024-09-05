@@ -1,7 +1,7 @@
-/*** includes ***/ 
+/*** includes ***/
 
 #define _DEFAULT_SOURCE
-#define _BSD_SOURCE 
+#define _BSD_SOURCE
 #define _GNU_SOURCE
 
 #include <ctype.h>
@@ -69,7 +69,7 @@ struct editorConfig conf;
 
 void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
-char *editorPrompt(char *prompt);
+char *editorPrompt(char *prompt, void(*callback)(char *, int));
 
 /*** terminal ***/
 
@@ -196,6 +196,18 @@ int editorRowCxToRx(editorRow *erow, int cX){
     }
     
     return rX;
+}
+
+int editorRowRxToCx(editorRow *eRow, int rx) {
+  int cur_rX = 0;
+  int cX;
+  for (cX = 0; cX < eRow->tSize; cX++) {
+    if (eRow->text[cX] == '\t')
+      cur_rX += (KILO_TAB_STOP - 1) - (cur_rX % KILO_TAB_STOP);
+    cur_rX++;
+    if (cur_rX > rx) return cX;
+  }
+  return cX;
 }
 
 void editorUpdateRow(editorRow *erow){
@@ -365,7 +377,7 @@ void editorOpen(char *fileName){
 
 void editorSave(){
     if (conf.filename == NULL){
-        conf.filename = editorPrompt("Save as: %s");
+        conf.filename = editorPrompt("Save as: %s", NULL);
         if (conf.filename == NULL){
             editorSetStatusMessage("Save canceled");
             return;
@@ -391,6 +403,62 @@ void editorSave(){
 
     free(buf);
     editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
+}
+
+/*** find ***/
+
+void editorFindCallback(char *query, int key){
+    static int last_match = -1;
+    static int direction = 1;
+    
+    if (key == '\r' || key == '\x1b'){
+        last_match = -1;
+        direction = 1;
+        return;
+    } else if (key == ARROW_RIGHT || key == ARROW_DOWN) {
+        direction = 1;
+    } else if (key == ARROW_LEFT || key == ARROW_UP) {
+        direction = -1;
+    } else {
+        last_match = -1;
+        direction = 1;
+    }
+
+    if (last_match == -1) direction = 1;
+    int curr = last_match;
+    for (int i = 0; i < conf.numRows; i++){
+        curr += direction;
+        if (curr == -1) curr = conf.numRows-1;
+        else if (curr == conf.numRows) curr = 0;
+
+        editorRow *eRow = &conf.eRow[curr];
+        char *match = strstr(eRow->render, query);
+        if (match){
+            last_match = curr;
+            conf.cY = curr;
+            conf.cX = editorRowRxToCx(eRow, match - eRow->render);
+            conf.rowOff = conf.numRows;
+            break;
+        }
+    }
+}
+
+void editorFind(){
+    int saved_cX = conf.cX;
+    int saved_cY = conf.cY;
+    int saved_colOff = conf.colOff;
+    int save_rowOff = conf.rowOff;
+    
+    char *query = editorPrompt("Search: %s (Use ARROWS/ENTER/ESC)", editorFindCallback);
+
+    if (query)
+        free(query);
+    else {
+        conf.cX = saved_cX;
+        conf.cY = saved_cY;
+        conf.colOff = saved_colOff;
+        conf.rowOff = save_rowOff;
+    }
 }
 
 /*** append buffer ***/
@@ -537,7 +605,7 @@ void editorSetStatusMessage(const char *fmt, ...){
 
 /*** input ***/
 
-char *editorPrompt(char *prompt){
+char *editorPrompt(char *prompt, void(*callback)(char *, int)){
     size_t bufSize = 128;
     char *buf = malloc(bufSize);
 
@@ -553,11 +621,13 @@ char *editorPrompt(char *prompt){
             if (bufLen != 0) buf[--bufLen] = '\0';
         } else if (key == '\x1b') {
             editorSetStatusMessage("");
+            if (callback) callback(buf, key);
             free(buf);
             return NULL;
         } else if (key == '\r') {
             if (bufLen != 0) {
                 editorSetStatusMessage("");
+                if (callback) callback(buf, key);
                 return buf;
         }
         } else if (!iscntrl(key) && key < 128) {
@@ -569,6 +639,8 @@ char *editorPrompt(char *prompt){
         buf[bufLen++] = key;
         buf[bufLen] = '\0';
         }
+        
+        if (callback) callback(buf, key);
     }
 }
 
@@ -577,22 +649,22 @@ void editorMoveCursor(int key){
     
     switch(key){
         case ARROW_UP:
-            if(conf.cY != 0)
+            if(conf.cY != 0){
                 conf.cY--;
+                conf.cX = conf.eRow[conf.cY].rSize;
+            }
             break;
             
         case ARROW_LEFT:
             if(conf.cX != 0)
                 conf.cX--;
-            else if (conf.cY > 0){
+            else if (conf.cY > 0)
                 conf.cY--;
-                conf.cX = conf.eRow[conf.cY].tSize;
-            }
             break;
 
         case ARROW_DOWN:
             if(conf.cY < conf.numRows)
-                conf.cY++;
+                conf.cY++;            
             break;
 
         case ARROW_RIGHT:
@@ -631,6 +703,10 @@ void editorProcessKeypress(){
             write(STDOUT_FILENO, "\x1b[2J", 4);
             write(STDOUT_FILENO, "\x1b[H", 3);
             exit(0);
+            break;
+
+        case CTRL_KEY('f'):
+            editorFind();
             break;
 
         case CTRL_KEY('s'):
@@ -711,7 +787,7 @@ int main(int argc, char *argv[]) {
     if (argc >= 2)
         editorOpen(argv[1]);
     
-    editorSetStatusMessage("HELP: Ctrl-Q = save | Ctrl-Q = quit");
+    editorSetStatusMessage("HELP: Ctrl-Q = save | Ctrl-F = find | Ctrl-Q = quit");
 
     while (1){
         editorRefreshScreen();
